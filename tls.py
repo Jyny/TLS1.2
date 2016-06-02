@@ -60,10 +60,10 @@ def main():
 	sc_data = f2.read()
 	f1.close()
 	f2.close()
-	
-	cli_application_data = []
-	serv_application_data = []
-	
+
+	clie_app_data = []
+	serv_app_data = []
+
 	# client to server demsg
 	while len(cs_data) > 0:
 		typ, ver1, ver2, len1, len2 = cs_data[:5]
@@ -71,21 +71,21 @@ def main():
 		fragment = cs_data[5:5+length]
 
 		if typ == 0x14:
-			cli_change_cipher_spec = fragment
+			clie_change_cipher_spec = fragment
 
 		elif typ == 0x15:
-			cli_alert = fragment
+			clie_alert = fragment
 
 		elif typ == 0x16:
 			if fragment[0] == 0x01:
-				cli_hello = fragment
+				clie_hello = fragment
 			elif fragment[0] == 0x10:
-				cli_key_exchange = fragment
+				clie_key_exchange = fragment
 			else:
-				cli_finished = fragment
+				clie_finished = fragment
 
 		elif typ == 0x17:
-			cli_application_data.append(fragment)
+			clie_app_data.append(fragment)
 
 		else:
 			print("client error type")
@@ -97,7 +97,7 @@ def main():
 		typ, ver1, ver2, len1, len2 = sc_data[:5]
 		length = (len1 * 256) + len2
 		fragment = sc_data[5:5+length]
-		
+
 		if typ == 0x14:
 			serv_change_cipher_spec = fragment
 
@@ -115,51 +115,52 @@ def main():
 				serv_finished = fragment
 
 		elif typ == 0x17:
-			serv_application_data.append(fragment)
+			serv_app_data.append(fragment)
 
 		else:
 			print("server error type")
 
 		sc_data = sc_data[5+length:]
-		
-	cli_random = cli_hello[6:38]
-	#print("cli_random:",cli_random.hex())
+
+	clie_random = clie_hello[6:38]
+	#print("clie_random:",clie_random.hex())
 
 	serv_random = serv_hello[6:38]
 	#print("serv_random:",serv_random.hex())
 
 	# TLS_PRF
-	encrypted_pre_master_secret = cli_key_exchange[6:]
+	encrypted_pre_master_secret = clie_key_exchange[6:]
 	pre_master_secret = RSA_DECRYPT(in3,encrypted_pre_master_secret)
-	master_secret = TLS_PRF(pre_master_secret ,b'master secret' ,cli_random+serv_random ,48)
-	result_master_secret = TLS_PRF(master_secret ,b'key expansion' ,serv_random+cli_random,104)
+	master_secret = TLS_PRF(pre_master_secret, b'master secret', clie_random+serv_random, 48)
+	key_expansion = TLS_PRF(master_secret, b'key expansion', serv_random+clie_random, 104)
 
-	cli_write_MAC_key = result_master_secret[:20]
-	serv_write_MAC_key = result_master_secret[20:40]
-	cli_write_key = result_master_secret[40:56]
-	serv_write_key = result_master_secret[56:72]
-	cli_write_iv = result_master_secret[72:88]
-	serv_write_iv = result_master_secret[88:104]
-	
-	cli_result = b''
+	clie_write_MAC_key = key_expansion[:20]
+	serv_write_MAC_key = key_expansion[20:40]
+	clie_write_key = key_expansion[40:56]
+	serv_write_key = key_expansion[56:72]
+	clie_write_iv = key_expansion[72:88]
+	serv_write_iv = key_expansion[88:104]
+
+	clie_result = b''
 	serv_result = b''
+
 	# decrypt client data
-	for each in cli_application_data:
-		temp = AES128CBC_DECRYPT(cli_write_key, cli_write_iv ,each)
+	for each in clie_app_data:
+		temp = AES128CBC_DECRYPT(clie_write_key, clie_write_iv ,each)
 		temp = temp[16:]
 		temp = temp[:-temp[-1]-1]
 		temp = temp[:-20]
-		cli_result += temp
+		clie_result += temp
 
 	# decrypt server data
-	for each in serv_application_data:
+	for each in serv_app_data:
 		temp = AES128CBC_DECRYPT(serv_write_key, serv_write_iv ,each)
 		temp = temp[16:]
 		temp = temp[:-temp[-1]-1]
 		temp = temp[:-20]
 		serv_result += temp
-	
-	#print("client", cli_result)
+
+	#print("client", clie_result)
 	#print("server", serv_result)
 
 	f1 = open(out1, 'rb')
@@ -167,7 +168,7 @@ def main():
 	client = f1.read()
 	server = f2.read()
 
-	if cli_result==client and serv_result==server:
+	if clie_result==client and serv_result==server:
 		print("OK")
 	else:
 		print("NO OK")
@@ -175,4 +176,3 @@ def main():
 
 if __name__ == '__main__':
 	main()
-

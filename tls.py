@@ -163,16 +163,12 @@ def main():
 	#print("client", clie_result)
 	#print("server", serv_result)
 
-	f1 = open(out1, 'rb')
-	f2 = open(out2, 'rb')
-	client = f1.read()
-	server = f2.read()
-
-	if clie_result==client and serv_result==server:
-		print("OK")
-	else:
-		print("NO OK")
-
+	f1 = open(out1, 'wb')
+	f2 = open(out2, 'wb')
+	f1.write(clie_result)
+	f2.write(serv_result)
+	f1.close()
+	f2.close()
 
 if __name__ == '__main__':
 	main()

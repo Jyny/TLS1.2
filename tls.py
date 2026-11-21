@@ -1,4 +1,13 @@
 import sys
+import hmac
+
+# TLS_RSA_WITH_AES_128_CBC_SHA (0x002f)
+MAC_LEN = 20    # HMAC-SHA1
+KEY_LEN = 16    # AES-128
+BLOCK = 16      # AES block size == explicit IV length
+
+CHANGE_CIPHER_SPEC, ALERT, HANDSHAKE, APPLICATION_DATA = 0x14, 0x15, 0x16, 0x17
+CLIENT_HELLO, SERVER_HELLO, CLIENT_KEY_EXCHANGE = 0x01, 0x02, 0x10
 
 def B2I(b):
 	assert type(b) is bytes
@@ -10,7 +19,6 @@ def I2B(i, length):
 	return int.to_bytes(i, length, byteorder='big')
 
 def HMAC_SHA256(key, msg):
-	import hmac
 	return hmac.new(key, msg, 'sha256').digest()
 
 def SYSTEM(command, stdin=None):
@@ -22,10 +30,12 @@ def SYSTEM(command, stdin=None):
 def RSA_DECRYPT(skfilename, ciphertext):
 	assert type(skfilename) is str
 	assert type(ciphertext) is bytes
+	# `rsautl` is deprecated since OpenSSL 3.0 and prints a warning on stderr;
+	# `pkeyutl` does the same PKCS#1 v1.5 decryption on OpenSSL 1.0+ / LibreSSL
 	stdout, stderr, retcode = SYSTEM((
-		'openssl', 'rsautl', '-decrypt', '-inkey', skfilename
+		'openssl', 'pkeyutl', '-decrypt', '-inkey', skfilename
 	), ciphertext)
-	assert retcode == 0 and stderr == b''
+	assert retcode == 0, stderr
 	return stdout
 
 def TLS_PRF(secret, label, seed, n_bytes):
@@ -46,129 +56,111 @@ def AES128CBC_DECRYPT(secret_key, ini_vector, ciphertext):
 	assert type(ciphertext) is bytes and len(ciphertext) % 16 == 0
 	stdout, stderr, retcode = SYSTEM((
 		'openssl', 'enc', '-aes-128-cbc', '-d', '-nopad',
-		'-K', ''.join('%02x'%x for x in secret_key),
-		'-iv', ''.join('%02x'%x for x in ini_vector)
+		'-K', secret_key.hex(),
+		'-iv', ini_vector.hex()
 	), ciphertext)
-	assert retcode == 0 and stderr == b''
+	assert retcode == 0, stderr
 	return stdout
+
+def parse_records(data):
+	# RFC 5246 6.2.1: type(1) version(2) length(2) fragment(length)
+	# Yields (seq, type, fragment); seq is the record sequence number used by
+	# the MAC, counted from 0 again after ChangeCipherSpec (None before it)
+	seq = None
+	pos = 0
+	while pos + 5 <= len(data):
+		typ = data[pos]
+		length = B2I(data[pos+3:pos+5])
+		fragment = data[pos+5:pos+5+length]
+		pos += 5 + length
+		yield seq, typ, fragment
+		if typ == CHANGE_CIPHER_SPEC:
+			seq = 0
+		elif seq is not None:
+			seq += 1
+
+def parse_handshakes(data):
+	# Returns {msg_type: body} from the plaintext handshake records. Messages
+	# may be coalesced into one record or split across several (RFC 5246 6.2.1),
+	# so join every fragment before splitting on the 4-byte message headers.
+	# Records after ChangeCipherSpec (the encrypted Finished) are skipped: their
+	# first byte is ciphertext and could look like any msg_type.
+	stream = b''.join(f for seq, typ, f in parse_records(data)
+		if typ == HANDSHAKE and seq is None)
+	messages = {}
+	pos = 0
+	while pos + 4 <= len(stream):
+		msg_type = stream[pos]
+		length = B2I(stream[pos+1:pos+4])
+		messages[msg_type] = stream[pos+4:pos+4+length]
+		pos += 4 + length
+	return messages
+
+def decrypt_app_data(data, mac_key, write_key):
+	records = [(seq, f) for seq, typ, f in parse_records(data)
+		if typ == APPLICATION_DATA]
+	if not records:
+		return b''
+	# CBC decryption of a block only needs the previous ciphertext block, so
+	# all records can go through one openssl call: inside each record the first
+	# block is the explicit IV (RFC 5246 6.2.3.2) and is thrown away anyway,
+	# hence whatever IV / preceding block it gets decrypted with doesn't matter.
+	plain = AES128CBC_DECRYPT(write_key, bytes(BLOCK), b''.join(f for _, f in records))
+
+	result = []
+	pos = 0
+	for seq, fragment in records:
+		block = plain[pos+BLOCK:pos+len(fragment)]
+		pos += len(fragment)
+
+		# GenericBlockCipher: content | MAC | padding | padding_length
+		pad_len = block[-1]
+		assert block[-pad_len-1:] == bytes([pad_len]) * (pad_len + 1), 'bad padding'
+		content = block[:-pad_len-1-MAC_LEN]
+		mac = block[-pad_len-1-MAC_LEN:-pad_len-1]
+
+		# RFC 5246 6.2.3.1: HMAC(seq_num + type + version + length + content)
+		header = I2B(seq, 8) + bytes([APPLICATION_DATA, 3, 3]) + I2B(len(content), 2)
+		expected = hmac.new(mac_key, header + content, 'sha1').digest()
+		assert hmac.compare_digest(mac, expected), 'bad MAC (wrong keys?)'
+
+		result.append(content)
+	return b''.join(result)
 
 def main():
 	in1, in2, in3, out1, out2 = sys.argv[1:]
-	f1 = open(in1, 'rb') # client-to-server
-	f2 = open(in2, 'rb') # server-to-client
-	cs_data = f1.read()
-	sc_data = f2.read()
-	f1.close()
-	f2.close()
+	with open(in1, 'rb') as f:
+		cs_data = f.read()  # client-to-server
+	with open(in2, 'rb') as f:
+		sc_data = f.read()  # server-to-client
 
-	clie_app_data = []
-	serv_app_data = []
+	clie_hs = parse_handshakes(cs_data)
+	serv_hs = parse_handshakes(sc_data)
 
-	# client to server demsg
-	while len(cs_data) > 0:
-		typ, ver1, ver2, len1, len2 = cs_data[:5]
-		length = (len1 * 256) + len2
-		fragment = cs_data[5:5+length]
+	# Hello body: version(2) random(32) ...
+	clie_random = clie_hs[CLIENT_HELLO][2:34]
+	serv_random = serv_hs[SERVER_HELLO][2:34]
 
-		if typ == 0x14:
-			clie_change_cipher_spec = fragment
+	# ClientKeyExchange body: length(2) encrypted_pre_master_secret(length)
+	cke = clie_hs[CLIENT_KEY_EXCHANGE]
+	encrypted_pre_master_secret = cke[2:2+B2I(cke[:2])]
+	pre_master_secret = RSA_DECRYPT(in3, encrypted_pre_master_secret)
+	assert len(pre_master_secret) == 48
 
-		elif typ == 0x15:
-			clie_alert = fragment
+	# RFC 5246 8.1 / 6.3; TLS 1.2 CBC suites use explicit IVs, so the key block
+	# holds only the MAC keys and the encryption keys
+	master_secret = TLS_PRF(pre_master_secret, b'master secret', clie_random + serv_random, 48)
+	key_block = TLS_PRF(master_secret, b'key expansion', serv_random + clie_random, 2 * (MAC_LEN + KEY_LEN))
 
-		elif typ == 0x16:
-			if fragment[0] == 0x01:
-				clie_hello = fragment
-			elif fragment[0] == 0x10:
-				clie_key_exchange = fragment
-			else:
-				clie_finished = fragment
+	clie_write_MAC_key = key_block[:MAC_LEN]
+	serv_write_MAC_key = key_block[MAC_LEN:2*MAC_LEN]
+	clie_write_key = key_block[2*MAC_LEN:2*MAC_LEN+KEY_LEN]
+	serv_write_key = key_block[2*MAC_LEN+KEY_LEN:]
 
-		elif typ == 0x17:
-			clie_app_data.append(fragment)
-
-		else:
-			print("client error type")
-
-		cs_data = cs_data[5+length:]
-
-	# server to client demsg
-	while len(sc_data) > 0:
-		typ, ver1, ver2, len1, len2 = sc_data[:5]
-		length = (len1 * 256) + len2
-		fragment = sc_data[5:5+length]
-
-		if typ == 0x14:
-			serv_change_cipher_spec = fragment
-
-		elif typ == 0x15:
-			serv_alert = fragment
-
-		elif typ == 0x16:
-			if fragment[0] == 0x02:
-				serv_hello = fragment
-			elif fragment[0] == 0x0B:
-				serv_certificate = fragment
-			elif fragment[0] == 0x0E:
-				serv_hello_done = fragment
-			else:
-				serv_finished = fragment
-
-		elif typ == 0x17:
-			serv_app_data.append(fragment)
-
-		else:
-			print("server error type")
-
-		sc_data = sc_data[5+length:]
-
-	clie_random = clie_hello[6:38]
-	#print("clie_random:",clie_random.hex())
-
-	serv_random = serv_hello[6:38]
-	#print("serv_random:",serv_random.hex())
-
-	# TLS_PRF
-	encrypted_pre_master_secret = clie_key_exchange[6:]
-	pre_master_secret = RSA_DECRYPT(in3,encrypted_pre_master_secret)
-	master_secret = TLS_PRF(pre_master_secret, b'master secret', clie_random+serv_random, 48)
-	key_expansion = TLS_PRF(master_secret, b'key expansion', serv_random+clie_random, 104)
-
-	clie_write_MAC_key = key_expansion[:20]
-	serv_write_MAC_key = key_expansion[20:40]
-	clie_write_key = key_expansion[40:56]
-	serv_write_key = key_expansion[56:72]
-	clie_write_iv = key_expansion[72:88]
-	serv_write_iv = key_expansion[88:104]
-
-	clie_result = b''
-	serv_result = b''
-
-	# decrypt client data
-	for each in clie_app_data:
-		temp = AES128CBC_DECRYPT(clie_write_key, clie_write_iv ,each)
-		temp = temp[16:]
-		temp = temp[:-temp[-1]-1]
-		temp = temp[:-20]
-		clie_result += temp
-
-	# decrypt server data
-	for each in serv_app_data:
-		temp = AES128CBC_DECRYPT(serv_write_key, serv_write_iv ,each)
-		temp = temp[16:]
-		temp = temp[:-temp[-1]-1]
-		temp = temp[:-20]
-		serv_result += temp
-
-	#print("client", clie_result)
-	#print("server", serv_result)
-
-	f1 = open(out1, 'wb')
-	f2 = open(out2, 'wb')
-	f1.write(clie_result)
-	f2.write(serv_result)
-	f1.close()
-	f2.close()
+	with open(out1, 'wb') as f:
+		f.write(decrypt_app_data(cs_data, clie_write_MAC_key, clie_write_key))
+	with open(out2, 'wb') as f:
+		f.write(decrypt_app_data(sc_data, serv_write_MAC_key, serv_write_key))
 
 if __name__ == '__main__':
 	main()
